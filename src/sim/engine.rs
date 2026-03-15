@@ -20,6 +20,8 @@ pub struct Simulator {
     events: HashMap<isize, Event>,
     /// Cached root event id
     root_id: isize,
+    /// Set to true when DebugFinish is hit
+    finished: bool,
 }
 
 impl Simulator {
@@ -56,8 +58,9 @@ impl Simulator {
         }
 
         Self {
-            regs, heap, wires, events,root_id,
+            regs, heap, wires, events, root_id,
             pending_writes: Vec::new(),
+            finished: false,
         }
     }
 
@@ -65,34 +68,36 @@ impl Simulator {
     pub fn run(&mut self) {
         let mut prev_cycle: isize = -1;
 
-        while let Some(Reverse((cycle, event_id))) = self.heap.pop() {
+        while !self.finished {
+            let Some(Reverse((cycle, event_id))) = self.heap.pop() else { break };
+
             if cycle != prev_cycle {
                 self.apply_pending_writes();
                 prev_cycle = cycle;
             }
 
-            if self.fire_event(event_id, cycle) {
-                return;
-            }
+            self.fire_event(event_id, cycle);
         }
     }
 
-    /// Fire a single event. Returns true if simulation should stop (DebugFinish).
-    fn fire_event(&mut self, event_id: isize, cycle: isize) -> bool {
-        if self.execute_actions(event_id) {
-            return true;
-        }
+    /// Fire a single event.
+    fn fire_event(&mut self, event_id: isize, cycle: isize) {
+        if self.finished { return; }
+        self.execute_actions(event_id);
+        if self.finished { return; }
         self.schedule_successors(event_id, cycle);
-        false
     }
 
-    /// Execute actions for an event. Returns true if DebugFinish was hit.
-    fn execute_actions(&mut self, event_id: isize) -> bool {
+    /// Execute actions for an event.
+    fn execute_actions(&mut self, event_id: isize) {
         let event = self.events.get(&event_id).expect("no event found");
 
         for action in &event.actions {
             match action {
-                Action::DebugFinish => return true,
+                Action::DebugFinish => {
+                    self.finished = true;
+                    return;
+                },
                 Action::DebugPrint { fmt, args } => {
                     let values: Vec<isize> = args.iter()
                         .map(|ld| eval_wire(ld.wire_id.unwrap(), &self.wires, &self.regs))
@@ -106,7 +111,6 @@ impl Simulator {
                 _ => todo!(),
             }
         }
-        false
     }
 
     /// Schedule successor events based on their source type.
@@ -116,6 +120,7 @@ impl Simulator {
         let is_recurse = event.is_recurse;
 
         for succ_id in outs {
+            if self.finished { return; }
             let succ = self.events.get(&succ_id).expect("no successor event found");
             match &succ.source {
                 EventSource::SeqCycles { cycles, .. } => {
@@ -125,7 +130,6 @@ impl Simulator {
                     let cond_val = eval_wire(cond_wire_id.unwrap(), &self.wires, &self.regs);
                     let should_fire = match branch_cond {
                         BranchCond::TrueFalse(_) => {
-                            // sel 0 = true branch, sel 1 = false branch
                             (*branch_sel == 0 && cond_val != 0) || (*branch_sel == 1 && cond_val == 0)
                         },
                         BranchCond::MatchCases { patterns } => {
@@ -148,7 +152,7 @@ impl Simulator {
         }
 
         // if this event is a recurse point, re-fire the root event
-        if is_recurse {
+        if is_recurse && !self.finished {
             self.fire_event(self.root_id, cycle);
         }
     }
