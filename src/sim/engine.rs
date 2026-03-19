@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Reverse;
 use crate::ir::types::*;
 use super::eval::eval_wire;
@@ -22,6 +22,8 @@ pub struct Simulator {
     root_id: isize,
     /// Set to true when DebugFinish is hit
     finished: bool,
+    /// Hashset to track later events
+    later_events: HashSet<isize>,
 }
 
 impl Simulator {
@@ -61,6 +63,7 @@ impl Simulator {
             regs, heap, wires, events, root_id,
             pending_writes: Vec::new(),
             finished: false,
+            later_events: HashSet::new(),
         }
     }
 
@@ -106,7 +109,19 @@ impl Simulator {
                 },
                 Action::RegAssign { target, value } => {
                     let val = eval_wire(value.wire_id.unwrap(), &self.wires, &self.regs);
-                    self.pending_writes.push((target.reg.clone(), val));
+                    
+                    let offset = 
+                        if target.offset_is_const { 
+                            target.offset 
+                        } else { 
+                            eval_wire(target.offset, &self.wires, &self.regs) 
+                        };
+                    
+                    let mask = ((1isize << target.size) - 1) << offset;                                                                                                
+                    let current = *self.regs.get(&target.reg).unwrap_or(&0);                                                                                         
+                    let new_val = (current & !mask) | ((val << offset) & mask); 
+
+                    self.pending_writes.push((target.reg.clone(), new_val));
                 },
                 _ => todo!(),
             }
@@ -121,6 +136,7 @@ impl Simulator {
 
         for succ_id in outs {
             if self.finished { return; }
+
             let succ = self.events.get(&succ_id).expect("no successor event found");
             match &succ.source {
                 EventSource::SeqCycles { cycles, .. } => {
@@ -147,6 +163,14 @@ impl Simulator {
                 EventSource::Branch { .. } => {
                     self.fire_event(succ_id, cycle);
                 },
+                EventSource::Later { .. } => {
+                    if self.later_events.remove(&succ_id) {
+                        self.fire_event(succ_id, cycle);
+                    } else {
+                        self.later_events.insert(succ_id);
+                    }
+                },
+                
                 _ => todo!(),
             }
         }

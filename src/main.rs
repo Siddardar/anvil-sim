@@ -6,6 +6,15 @@ use ir::types::*;
 
 type Value = isize;
 
+use clap::Parser;
+#[derive(Parser, Debug)]
+struct Cli {
+    file:String,
+
+    #[arg(long)]
+    eval:bool
+}
+
 unsafe extern "C" {
     fn caml_startup(argv: *mut *mut i8);
     fn caml_named_value(name: *const i8) -> *const Value;
@@ -41,10 +50,12 @@ fn ocaml_string(v: Value) -> String {
 
 fn main() {
     // cargo run -- ../anvil/examples/cache.anvil 
-    let filename = std::env::args().nth(1).expect("Usage: anvil-sim <file.anvil>");
+    let cli = Cli::parse();
+    let filename = cli.file;
+    let is_json_output_only = cli.eval;
 
     unsafe {
-        let arg0 = CString::new("anvil-sim").unwrap();
+        let arg0 = CString::new("anvil-sim").unwrap();  
         let mut argv = [arg0.as_ptr() as *mut _, std::ptr::null_mut()];
         caml_startup(argv.as_mut_ptr());
 
@@ -55,6 +66,20 @@ fn main() {
         let json_str = ocaml_string(ocaml_call("compile_to_ir", ocaml_filename));
         if json_str.is_empty() {
             panic!("compilation failed")
+        }
+
+        if is_json_output_only {
+            let pretty_json = serde_json::to_string_pretty(
+                &serde_json::from_str::<serde_json::Value>(&json_str)
+                    .expect("failed to parse JSON for pretty printing"),
+            )
+            .expect("failed to pretty print JSON");
+
+            std::fs::write("test.json", format!("{}\n", pretty_json))
+                .expect("failed to write test.json");
+
+            println!("{}", pretty_json);
+            return;
         }
 
         let collections: Vec<Collection> = serde_json::from_str(&json_str)
