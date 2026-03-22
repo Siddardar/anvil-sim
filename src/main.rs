@@ -85,15 +85,13 @@ fn main() {
         let collections: Vec<Collection> = serde_json::from_str(&json_str)
             .expect("failed to desearlise");
 
-        // For now, simulate the first thread of the first process
-        let thread = collections.into_iter()
+        // For now, only simulate one proc
+        let proc = collections.into_iter()
             .next().expect("no collections")
             .procs.into_iter()
-            .next().expect("no procs")
-            .threads.into_iter()
-            .next().expect("no threads");
+            .next().expect("no procs");
 
-        let mut sim = sim::engine::Simulator::new(thread);
+        let mut sim = sim::engine::Simulator::new(proc.threads);
         sim.run();
 
         std::process::exit(0);

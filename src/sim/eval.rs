@@ -5,11 +5,11 @@ use crate::ir::types::*;
 /// `wires` maps wire id -> Wire definition.
 /// `regs` maps register name -> current value.
 pub fn eval_wire(
-    wire_id: isize,
-    wires: &HashMap<isize, Wire>,
+    wire_id: usize,
+    wires: &Vec<Wire>,
     regs: &HashMap<String, isize>,
 ) -> isize {
-    let current_wire = wires.get(&wire_id).expect("unknown wire id");
+    let current_wire = wires.get(wire_id).expect("unknown wire id");
     let raw = match &current_wire.source {
         WireSource::Literal { value, width:_ } => *value,
         
@@ -19,13 +19,13 @@ pub fn eval_wire(
             let left_val = eval_wire(*left, wires, regs);
             // TODO: right can also be an array of ids where you check if left val
             // is equal to one of the wire ids vals on the right. 
-            let right_id = right.as_i64().expect("expected single wire id") as isize;
+            let right_id = right.as_u64().expect("expected single wire id") as usize;
             let right_val = eval_wire(right_id, wires, regs);
             eval_bin_op(op, left_val, right_val)
         },
 
         WireSource::Unary { op, operand } => {
-            let operand_wire = wires.get(operand).expect("unknown wire id");
+            let operand_wire = wires.get(*operand).expect("unknown wire id");
             let operand_size = operand_wire.size;
             let operand_val = eval_wire(*operand, wires, regs);
             eval_un_op(op, operand_val, operand_size)
@@ -55,7 +55,7 @@ pub fn eval_wire(
         WireSource::Concat { wires: wire_ids } => {
             let mut result: isize = 0;
             for &wid in wire_ids {
-                let w = wires.get(&wid).expect("unknown wire id");
+                let w = wires.get(wid).expect("unknown wire id");
                 let val = eval_wire(wid, wires, regs);
                 result = (result << w.size) | (val & ((1 << w.size) - 1));
             }
@@ -68,7 +68,7 @@ pub fn eval_wire(
                 n as isize
             } else {
                 // offset is a wire id, evaluate it
-                eval_wire(offset.as_i64().unwrap() as isize, wires, regs)
+                eval_wire(offset.as_i64().unwrap() as usize, wires, regs)
             };
             // shift right by offset, then mask to len bits
             (wire_val >> off) & ((1 << len) - 1)
@@ -116,7 +116,7 @@ fn eval_bin_op(op: &BinOp, left: isize, right: isize) -> isize {
     }
 }
 
-fn eval_un_op(op: &UnOp, val: isize, current_wire_size: isize) -> isize {
+fn eval_un_op(op: &UnOp, val: isize, current_wire_size: usize) -> isize {
     match op {
         UnOp::Neg => -val,
         UnOp::Not => !val,
