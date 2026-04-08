@@ -136,16 +136,35 @@ impl SimState {
     }
 
     /// Execute actions for an event.
+    /// ImmediateSend actions run first so channel data is available
+    /// before any MessagePort wire evaluations block.
     fn execute_actions(&mut self, thread: &ThreadState, event_id: usize, proc_name: &str, channel_table: &ChannelTable, global_finished: &GlobalFinished) {
         let event = &thread.events[event_id];
         let wires = &thread.wires;
 
+        // execute all ImmediateSend actions first
+        for action in &event.actions {
+            if let Action::ImmediateSend { endpoint, msg, value } = action {
+                let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished);
+                let handler = channel_table.get(endpoint)
+                    .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
+                let mut ch = handler.inner.lock().unwrap();
+                while ch.data.get(msg).copied().flatten().is_some() {
+                    if global_finished.load(Ordering::SeqCst) { return; }
+                    ch = handler.condvar.wait(ch).unwrap();
+                }
+                ch.data.insert(msg.clone(), Some(val));
+                handler.condvar.notify_all();
+            }
+        }
+
+        // execute everything else
         for action in &event.actions {
             match action {
+                Action::ImmediateSend { .. } => {}, // already handled above
                 Action::DebugFinish => {
                     self.finished = true;
                     global_finished.store(true, Ordering::SeqCst);
-                    // Wake any threads blocked on channel condvars
                     for handler in channel_table.values() {
                         handler.condvar.notify_all();
                     }
@@ -172,19 +191,6 @@ impl SimState {
                     let new_val = (current & !mask) | ((val << offset) & mask);
 
                     self.pending_writes.push((target.reg.clone(), new_val));
-                },
-                Action::ImmediateSend { endpoint, msg, value } => {
-                    let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished);
-                    let handler = channel_table.get(endpoint)
-                        .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
-                    // Wait until previous value is consumed before sending
-                    let mut ch = handler.inner.lock().unwrap();
-                    while ch.data.get(msg).copied().flatten().is_some() {
-                        if global_finished.load(Ordering::SeqCst) { return; }
-                        ch = handler.condvar.wait(ch).unwrap();
-                    }
-                    ch.data.insert(msg.clone(), Some(val));
-                    handler.condvar.notify_all();
                 },
                 Action::ImmediateRecv { endpoint, msg } => {
                     let handler = channel_table.get(endpoint)
