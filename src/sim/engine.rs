@@ -29,7 +29,7 @@ pub struct ChannelHandler {
     pub condvar: Condvar,
 }
 
-pub type ChannelTable = HashMap<(String, String), Arc<ChannelHandler>>;
+pub type ChannelTable = HashMap<String, Arc<ChannelHandler>>;
 pub type GlobalFinished = Arc<AtomicBool>;
 
 /// Shared mutable simulation state (separate from threads for split borrowing)
@@ -144,6 +144,11 @@ impl SimState {
             match action {
                 Action::DebugFinish => {
                     self.finished = true;
+                    global_finished.store(true, Ordering::SeqCst);
+                    // Wake any threads blocked on channel condvars
+                    for handler in channel_table.values() {
+                        handler.condvar.notify_all();
+                    }
                     return;
                 },
                 Action::DebugPrint { fmt, args } => {
@@ -167,6 +172,26 @@ impl SimState {
                     let new_val = (current & !mask) | ((val << offset) & mask);
 
                     self.pending_writes.push((target.reg.clone(), new_val));
+                },
+                Action::ImmediateSend { endpoint, msg, value } => {
+                    let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished);
+                    let handler = channel_table.get(endpoint)
+                        .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
+                    // Wait until previous value is consumed before sending
+                    let mut ch = handler.inner.lock().unwrap();
+                    while ch.data.get(msg).copied().flatten().is_some() {
+                        if global_finished.load(Ordering::SeqCst) { return; }
+                        ch = handler.condvar.wait(ch).unwrap();
+                    }
+                    ch.data.insert(msg.clone(), Some(val));
+                    handler.condvar.notify_all();
+                },
+                Action::ImmediateRecv { endpoint, msg } => {
+                    let handler = channel_table.get(endpoint)
+                        .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
+                    let mut ch = handler.inner.lock().unwrap();
+                    ch.data.insert(msg.clone(), None);
+                    handler.condvar.notify_all();
                 },
                 _ => todo!(),
             }

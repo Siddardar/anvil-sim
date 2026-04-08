@@ -89,7 +89,18 @@ pub fn eval_wire(
             result
         },
 
-        WireSource::MessagePort { .. } => todo!("MessagePort not yet supported"),
+        WireSource::MessagePort { endpoint, msg, .. } => {
+            let handler = channel_table.get(endpoint)
+                .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
+            let mut ch = handler.inner.lock().unwrap();
+            while ch.data.get(msg).copied().flatten().is_none() {
+                if global_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    return 0;
+                }
+                ch = handler.condvar.wait(ch).unwrap();
+            }
+            ch.data[msg].unwrap()
+        },
         WireSource::MessageValidPort { .. } => todo!("MessageValidPort not yet supported"),
         WireSource::MessageAckPort { .. } => todo!("MessageAckPort not yet supported"),
     };

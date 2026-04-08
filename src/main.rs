@@ -3,8 +3,9 @@ mod sim;
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, Condvar, atomic::AtomicBool};
 use ir::types::*;
+use sim::engine::{ChannelTable, SharedChannel, ChannelHandler};
 
 type Value = isize;
 
@@ -91,7 +92,36 @@ fn main() {
             .flat_map(|c| c.procs)
             .collect();
 
-        let channel_table = Arc::new(HashMap::new());
+        // Build a name -> args lookup for resolving spawn endpoint aliases
+        let proc_args: HashMap<String, Vec<String>> = procs.iter()
+            .map(|p| (p.name.clone(), p.args.clone()))
+            .collect();
+
+        // Build the channel table
+        let mut channel_table: ChannelTable = HashMap::new();
+        for proc in &procs {
+            for ch in &proc.channels {
+                let handler = Arc::new(ChannelHandler {
+                    inner: Mutex::new(SharedChannel { data: HashMap::new() }),
+                    condvar: Condvar::new(),
+                });
+                channel_table.insert(ch.left.clone(), Arc::clone(&handler));
+                channel_table.insert(ch.right.clone(), handler);
+            }
+
+            // Resolve spawn endpoint aliases: spawned proc's args -> parent's endpoint names
+            for spawn in &proc.spawns {
+                if let Some(args) = proc_args.get(&spawn.module_name) {
+                    for (arg, endpoint) in args.iter().zip(spawn.endpoints.iter()) {
+                        if let Some(handler) = channel_table.get(endpoint) {
+                            channel_table.insert(arg.clone(), Arc::clone(handler));
+                        }
+                    }
+                }
+            }
+        }
+
+        let channel_table = Arc::new(channel_table);
         let global_finished = Arc::new(AtomicBool::new(false));
 
         let handles: Vec<_> = procs.into_iter().map(|proc| {
