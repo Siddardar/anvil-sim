@@ -1,4 +1,5 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
 use std::cmp::Reverse;
 use crate::ir::types::*;
 use super::eval::eval_wire;
@@ -19,6 +20,18 @@ struct ThreadState {
     later_events: HashSet<usize>,
 }
 
+pub struct SharedChannel {
+    pub data: HashMap<String, Option<isize>>, // msg name -> val
+}
+
+pub struct ChannelHandler {
+    pub inner: Mutex<SharedChannel>,
+    pub condvar: Condvar,
+}
+
+pub type ChannelTable = HashMap<(String, String), Arc<ChannelHandler>>;
+pub type GlobalFinished = Arc<AtomicBool>;
+
 /// Shared mutable simulation state (separate from threads for split borrowing)
 struct SimState {
     /// Current register values (what RegRead sees)
@@ -32,13 +45,16 @@ struct SimState {
 }
 
 pub struct Simulator {
+    proc_name: String,
+    channel_table: Arc<ChannelTable>,
+    global_finished: GlobalFinished,
     threads: Vec<ThreadState>,
     state: SimState,
 }
 
 impl Simulator {
     /// Build a simulator from a single-proc IR.
-    pub fn new(proc_threads: Vec<EventGraph>) -> Self {
+    pub fn new (proc_name: String, proc_threads: Vec<EventGraph>, channel_table: Arc<ChannelTable>, global_finished: GlobalFinished) -> Self {
         let mut heap = BinaryHeap::new();
 
         let mut regs = HashMap::new();
@@ -77,6 +93,9 @@ impl Simulator {
         }
 
         Self {
+            proc_name,
+            channel_table,
+            global_finished,
             threads,
             state: SimState {
                 regs, heap,
@@ -88,14 +107,14 @@ impl Simulator {
 
     /// Run the simulation until DebugFinish or heap is empty.
     pub fn run(&mut self) {
-        while !self.state.finished {
+        while !self.state.finished && !self.global_finished.load(Ordering::SeqCst) {
             let Some(Reverse((cycle, event_id, thread_idx))) = self.state.heap.pop() else { break };
 
-            self.state.fire_event(&mut self.threads[thread_idx], cycle, event_id, thread_idx);
+            self.state.fire_event(&mut self.threads[thread_idx], cycle, event_id, thread_idx, &self.proc_name, &self.channel_table, &self.global_finished);
             while let Some(Reverse((next_cycle, _, _))) = self.state.heap.peek() {
                 if *next_cycle != cycle { break; }
                 let Reverse((_, next_id, next_thread_idx)) = self.state.heap.pop().unwrap();
-                self.state.fire_event(&mut self.threads[next_thread_idx], cycle, next_id, next_thread_idx);
+                self.state.fire_event(&mut self.threads[next_thread_idx], cycle, next_id, next_thread_idx, &self.proc_name, &self.channel_table, &self.global_finished);
             }
 
             self.state.apply_pending_writes();
@@ -105,15 +124,19 @@ impl Simulator {
 
 impl SimState {
     /// Fire a single event.
-    fn fire_event(&mut self, thread: &mut ThreadState, cycle: usize, event_id: usize, thread_idx: usize) {
+    fn fire_event(
+        &mut self, thread: &mut ThreadState, cycle: usize, event_id: usize, 
+        thread_idx: usize, proc_name: &str, channel_table: &ChannelTable, 
+        global_finished: &GlobalFinished) {  
+
         if self.finished { return; }
-        self.execute_actions(thread, event_id);
+        self.execute_actions(thread, event_id, proc_name, channel_table, global_finished);
         if self.finished { return; }
-        self.schedule_successors(thread, cycle, event_id, thread_idx);
+        self.schedule_successors(thread, cycle, event_id, thread_idx, proc_name, channel_table, global_finished);
     }
 
     /// Execute actions for an event.
-    fn execute_actions(&mut self, thread: &ThreadState, event_id: usize) {
+    fn execute_actions(&mut self, thread: &ThreadState, event_id: usize, proc_name: &str, channel_table: &ChannelTable, global_finished: &GlobalFinished) {
         let event = &thread.events[event_id];
         let wires = &thread.wires;
 
@@ -125,18 +148,18 @@ impl SimState {
                 },
                 Action::DebugPrint { fmt, args } => {
                     let values: Vec<isize> = args.iter()
-                        .map(|ld| eval_wire(ld.wire_id.unwrap(), wires, &self.regs))
+                        .map(|ld| eval_wire(ld.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished))
                         .collect();
                     println!("{}", Self::format_dprint(fmt, &values));
                 },
                 Action::RegAssign { target, value } => {
-                    let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs);
+                    let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished);
 
                     let offset =
                         if target.offset_is_const {
                             target.offset as isize
                         } else {
-                            eval_wire(target.offset, wires, &self.regs)
+                            eval_wire(target.offset, wires, &self.regs, proc_name, channel_table, global_finished)
                         };
 
                     let mask = ((1isize << target.size as isize) - 1) << offset;
@@ -151,7 +174,7 @@ impl SimState {
     }
 
     /// Schedule successor events based on their source type.
-    fn schedule_successors(&mut self, thread: &mut ThreadState, cycle: usize, event_id: usize, thread_idx: usize) {
+    fn schedule_successors(&mut self, thread: &mut ThreadState, cycle: usize, event_id: usize, thread_idx: usize, proc_name: &str, channel_table: &ChannelTable, global_finished: &GlobalFinished) {
         let outs = thread.events[event_id].outs.clone();
         let is_recurse = thread.events[event_id].is_recurse;
 
@@ -164,7 +187,7 @@ impl SimState {
                     self.heap.push(Reverse((cycle + *cycles, succ_id, thread_idx)));
                 },
                 EventSource::RootBranch { branch_sel, cond_wire_id, branch_cond, .. } => {
-                    let cond_val = eval_wire(cond_wire_id.unwrap(), &thread.wires, &self.regs);
+                    let cond_val = eval_wire(cond_wire_id.unwrap(), &thread.wires, &self.regs, proc_name, channel_table, global_finished);
                     let should_fire = match branch_cond {
                         BranchCond::TrueFalse(_) => {
                             (*branch_sel == 0 && cond_val != 0) || (*branch_sel == 1 && cond_val == 0)
@@ -172,21 +195,21 @@ impl SimState {
                         BranchCond::MatchCases { patterns } => {
                             let pat_val = eval_wire(
                                 patterns[*branch_sel].wire_id.unwrap(),
-                                &thread.wires, &self.regs,
+                                &thread.wires, &self.regs, proc_name, channel_table, global_finished,
                             );
                             cond_val == pat_val
                         },
                     };
                     if should_fire {
-                        self.fire_event(thread, cycle, succ_id, thread_idx);
+                        self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
                     }
                 },
                 EventSource::Branch { .. } => {
-                    self.fire_event(thread, cycle, succ_id, thread_idx);
+                    self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
                 },
                 EventSource::Later { .. } => {
                     if thread.later_events.remove(&succ_id) {
-                        self.fire_event(thread, cycle, succ_id, thread_idx);
+                        self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
                     } else {
                         thread.later_events.insert(succ_id);
                     }
@@ -198,7 +221,7 @@ impl SimState {
 
         // if this event is a recurse point, re-fire the root event
         if is_recurse && !self.finished {
-            self.fire_event(thread, cycle, thread.root_id, thread_idx);
+            self.fire_event(thread, cycle, thread.root_id, thread_idx, proc_name, channel_table, global_finished);
         }
     }
 

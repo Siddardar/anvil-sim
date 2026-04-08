@@ -1,7 +1,9 @@
 mod ir;
 mod sim;
 
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::{Arc, atomic::AtomicBool};
 use ir::types::*;
 
 type Value = isize;
@@ -85,14 +87,25 @@ fn main() {
         let collections: Vec<Collection> = serde_json::from_str(&json_str)
             .expect("failed to desearlise");
 
-        // For now, only simulate one proc
-        let proc = collections.into_iter()
-            .next().expect("no collections")
-            .procs.into_iter()
-            .next().expect("no procs");
+        let procs: Vec<ProcGraph> = collections.into_iter()
+            .flat_map(|c| c.procs)
+            .collect();
 
-        let mut sim = sim::engine::Simulator::new(proc.threads);
-        sim.run();
+        let channel_table = Arc::new(HashMap::new());
+        let global_finished = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<_> = procs.into_iter().map(|proc| {
+            let ct = Arc::clone(&channel_table);
+            let gf = Arc::clone(&global_finished);
+            std::thread::spawn(move || {
+                let mut sim = sim::engine::Simulator::new(proc.name, proc.threads, ct, gf);
+                sim.run();
+            })
+        }).collect();
+
+        for h in handles {
+            h.join().expect("proc thread panicked");
+        }
 
         std::process::exit(0);
     }

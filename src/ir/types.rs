@@ -9,13 +9,28 @@ pub struct Collection {
 pub struct ProcGraph {
     pub name: String,
     pub threads: Vec<EventGraph>,
+    pub spawns: Vec<SpawnDef>,
+    pub channels: Vec<ChannelDef>,
+    pub args: Vec<String>
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ChannelDef {
+    pub left: String,
+    pub right: String
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct SpawnDef {
+    pub module_name: String,
+    pub endpoints: Vec<String>
 }
 
 #[derive(Deserialize, Serialize)]
 pub struct EventGraph {
     pub thread_id: usize,
-    pub is_general_recursive: bool,
-    pub comb: bool,
+    pub is_general_recursive: bool, // not used by sim (can consider removing)
+    pub comb: bool, // not used by sim (can consider removing)
     pub events: Vec<Event>,
     pub wires: Vec<Wire>,
     pub regs: Vec<RegDef>,
