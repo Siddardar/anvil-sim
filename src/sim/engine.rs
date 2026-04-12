@@ -48,13 +48,14 @@ pub struct Simulator {
     proc_name: String,
     channel_table: Arc<ChannelTable>,
     global_finished: GlobalFinished,
+    max_cycles: Option<usize>,
     threads: Vec<ThreadState>,
     state: SimState,
 }
 
 impl Simulator {
     /// Build a simulator from a single-proc IR.
-    pub fn new (proc_name: String, proc_threads: Vec<EventGraph>, channel_table: Arc<ChannelTable>, global_finished: GlobalFinished) -> Self {
+    pub fn new (proc_name: String, proc_threads: Vec<EventGraph>, channel_table: Arc<ChannelTable>, global_finished: GlobalFinished, max_cycles: Option<usize>) -> Self {
         let mut heap = BinaryHeap::new();
 
         let mut regs = HashMap::new();
@@ -96,6 +97,7 @@ impl Simulator {
             proc_name,
             channel_table,
             global_finished,
+            max_cycles,
             threads,
             state: SimState {
                 regs, heap,
@@ -109,6 +111,16 @@ impl Simulator {
     pub fn run(&mut self) {
         while !self.state.finished && !self.global_finished.load(Ordering::SeqCst) {
             let Some(Reverse((cycle, event_id, thread_idx))) = self.state.heap.pop() else { break };
+
+            if let Some(max) = self.max_cycles {
+                if cycle >= max {
+                    self.global_finished.store(true, Ordering::SeqCst);
+                    for handler in self.channel_table.values() {
+                        handler.condvar.notify_all();
+                    }
+                    break;
+                }
+            }
 
             self.state.fire_event(&mut self.threads[thread_idx], cycle, event_id, thread_idx, &self.proc_name, &self.channel_table, &self.global_finished);
             while let Some(Reverse((next_cycle, _, _))) = self.state.heap.peek() {
@@ -158,10 +170,10 @@ impl SimState {
             }
         }
 
-        // execute everything else
+        // Phase 2: execute everything except ImmediateSend and ImmediateRecv
         for action in &event.actions {
             match action {
-                Action::ImmediateSend { .. } => {}, // already handled above
+                Action::ImmediateSend { .. } | Action::ImmediateRecv { .. } => {},
                 Action::DebugFinish => {
                     self.finished = true;
                     global_finished.store(true, Ordering::SeqCst);
@@ -192,14 +204,18 @@ impl SimState {
 
                     self.pending_writes.push((target.reg.clone(), new_val));
                 },
-                Action::ImmediateRecv { endpoint, msg } => {
-                    let handler = channel_table.get(endpoint)
-                        .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
-                    let mut ch = handler.inner.lock().unwrap();
-                    ch.data.insert(msg.clone(), None);
-                    handler.condvar.notify_all();
-                },
                 _ => todo!(),
+            }
+        }
+
+        // Phase 3: execute all ImmediateRecv last (after MessagePort reads)
+        for action in &event.actions {
+            if let Action::ImmediateRecv { endpoint, msg } = action {
+                let handler = channel_table.get(endpoint)
+                    .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
+                let mut ch = handler.inner.lock().unwrap();
+                ch.data.insert(msg.clone(), None);
+                handler.condvar.notify_all();
             }
         }
     }
@@ -245,7 +261,49 @@ impl SimState {
                         thread.later_events.insert(succ_id);
                     }
                 },
+                EventSource::SeqSend { endpoint, msg, .. } => {
+                    // Find the SustainedSend whose until_id matches this SeqSend event
+                    let wire_id = thread.events.iter()
+                        .flat_map(|e| e.sustained_actions.iter())
+                        .find_map(|sa| match sa {
+                            SustainedAction::SustainedSend { until_id, endpoint: ep, msg: m, value }
+                                if *until_id == succ_id && ep == endpoint && m == msg => Some(value.wire_id.unwrap()),
+                            _ => None
+                        })
+                        .expect("no SustainedSend for SeqSend");
 
+                    let val = eval_wire(wire_id, &thread.wires, &self.regs, proc_name, channel_table, global_finished);
+                    let handler = channel_table.get(endpoint)
+                        .unwrap_or_else(|| panic!("no channel for endpoint {}", endpoint));
+                    
+                    let mut ch = handler.inner.lock().unwrap();
+                    while ch.data.get(msg).copied().flatten().is_some() {
+                        if global_finished.load(Ordering::SeqCst) { return; }
+
+                        ch = handler.condvar.wait(ch).unwrap();
+                    }
+
+                    ch.data.insert(msg.clone(), Some(val));
+                    drop(ch);
+
+                    handler.condvar.notify_all();
+
+                    self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
+                },
+                EventSource::SeqRecv { endpoint, msg, .. } => {
+                    let handler = channel_table.get(endpoint)
+                        .unwrap_or_else(|| panic!("no channel for endpoint {}", endpoint));
+
+                    let mut ch = handler.inner.lock().unwrap();
+                    while ch.data.get(msg).copied().flatten().is_none() {
+                        if global_finished.load(Ordering::SeqCst) { return; }
+                        ch = handler.condvar.wait(ch).unwrap();
+                    }
+
+                    drop(ch);
+
+                    self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
+                }
                 _ => todo!(),
             }
         }

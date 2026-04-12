@@ -43,6 +43,7 @@ pub struct Event {
     pub outs: Vec<usize>,
     pub source: EventSource,
     pub actions: Vec<Action>,
+    pub sustained_actions: Vec<SustainedAction>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -80,6 +81,15 @@ pub enum Action {
     PutShared { name: String, value: LoweringData },
     ImmediateSend { endpoint: String, msg: String, value: LoweringData },
     ImmediateRecv { endpoint: String, msg: String },
+}
+
+/// SeqSend/SeqRecv
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum SustainedAction {
+    SustainedSend { until_id: usize, endpoint: String, msg: String, value: LoweringData},
+    SustainedRecv { until_id: usize, endpoint: String, msg: String},
+
 }
 
 /// Wrapper around the value of a wire. OCaml side also has additional metadata like lifetime values (todo)

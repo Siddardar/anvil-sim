@@ -15,7 +15,10 @@ struct Cli {
     file:String,
 
     #[arg(long)]
-    eval:bool
+    eval:bool,
+
+    #[arg(long)]
+    max_cycles: Option<usize>
 }
 
 unsafe extern "C" {
@@ -56,6 +59,7 @@ fn main() {
     let cli = Cli::parse();
     let filename = cli.file;
     let is_json_output_only = cli.eval;
+    let max_cycles = cli.max_cycles;
 
     unsafe {
         let arg0 = CString::new("anvil-sim").unwrap();  
@@ -128,7 +132,7 @@ fn main() {
             let ct = Arc::clone(&channel_table);
             let gf = Arc::clone(&global_finished);
             std::thread::spawn(move || {
-                let mut sim = sim::engine::Simulator::new(proc.name, proc.threads, ct, gf);
+                let mut sim = sim::engine::Simulator::new(proc.name, proc.threads, ct, gf, max_cycles);
                 sim.run();
             })
         }).collect();

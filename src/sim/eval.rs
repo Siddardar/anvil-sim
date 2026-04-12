@@ -101,7 +101,13 @@ pub fn eval_wire(
             }
             ch.data[msg].unwrap()
         },
-        WireSource::MessageValidPort { .. } => todo!("MessageValidPort not yet supported"),
+        WireSource::MessageValidPort { endpoint, msg} => { 
+            let handler = channel_table.get(endpoint)
+                .unwrap_or_else(|| panic!("no channel for endpoint {}", endpoint));
+            
+            let ch = handler.inner.lock().unwrap();                                                                        
+            if ch.data.get(msg).copied().flatten().is_some() { 1 } else { 0 }
+        },
         WireSource::MessageAckPort { .. } => todo!("MessageAckPort not yet supported"),
     };
 
