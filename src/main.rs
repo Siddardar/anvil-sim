@@ -101,35 +101,45 @@ fn main() {
             .map(|p| (p.name.clone(), p.args.clone()))
             .collect();
 
-        // Build the channel table
-        let mut channel_table: ChannelTable = HashMap::new();
+        // Build the base channel table (real endpoint names)
+        let mut base_channel_table: ChannelTable = HashMap::new();
         for proc in &procs {
             for ch in &proc.channels {
                 let handler = Arc::new(ChannelHandler {
                     inner: Mutex::new(SharedChannel { data: HashMap::new() }),
                     condvar: Condvar::new(),
                 });
-                channel_table.insert(ch.left.clone(), Arc::clone(&handler));
-                channel_table.insert(ch.right.clone(), handler);
+                base_channel_table.insert(ch.left.clone(), Arc::clone(&handler));
+                base_channel_table.insert(ch.right.clone(), handler);
             }
+        }
 
-            // Resolve spawn endpoint aliases: spawned proc's args -> parent's endpoint names
+        // Build per-proc alias maps from spawn definitions
+        let mut proc_aliases: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for proc in &procs {
             for spawn in &proc.spawns {
                 if let Some(args) = proc_args.get(&spawn.module_name) {
-                    for (arg, endpoint) in args.iter().zip(spawn.endpoints.iter()) {
-                        if let Some(handler) = channel_table.get(endpoint) {
-                            channel_table.insert(arg.clone(), Arc::clone(handler));
-                        }
-                    }
+                    let aliases: Vec<(String, String)> = args.iter()
+                        .zip(spawn.endpoints.iter())
+                        .map(|(arg, ep)| (arg.clone(), ep.clone()))
+                        .collect();
+                    proc_aliases.insert(spawn.module_name.clone(), aliases);
                 }
             }
         }
 
-        let channel_table = Arc::new(channel_table);
         let global_finished = Arc::new(AtomicBool::new(false));
 
         let handles: Vec<_> = procs.into_iter().map(|proc| {
-            let ct = Arc::clone(&channel_table);
+            let mut ct = base_channel_table.clone();
+            if let Some(aliases) = proc_aliases.get(&proc.name) {
+                for (arg, endpoint) in aliases {
+                    if let Some(handler) = base_channel_table.get(endpoint) {
+                        ct.insert(arg.clone(), Arc::clone(handler));
+                    }
+                }
+            }
+            let ct = Arc::new(ct);
             let gf = Arc::clone(&global_finished);
             std::thread::spawn(move || {
                 let mut sim = sim::engine::Simulator::new(proc.name, proc.threads, ct, gf, max_cycles);
