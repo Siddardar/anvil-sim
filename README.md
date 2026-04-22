@@ -127,6 +127,21 @@ There are two types of send and receive:
 
 When a `SeqSend` or `SeqRecv` can't complete immediately (slot full or empty), the event is **parked** — removed from the heap and stored in a `Vec<ParkedEvent>`.
 
+**Why not just block?** Each proc has a single run loop that processes events from the heap. If a `SeqRecv` blocked (via `condvar.wait`), the entire run loop would freeze — no other events from any logical thread in that proc could fire. Consider a bridge proc that forwards between two channels:
+
+```
+proc bridge(...) {
+    loop { let a = recv ch_A.req >> send ch_B.req(a) }   // Thread 0
+    loop { let b = recv ch_B.res >> send ch_A.res(b) }   // Thread 1
+}
+```
+
+Thread 0 and Thread 1 share the same heap and run loop. If Thread 0's `recv ch_A.req` blocked the run loop while waiting for data, Thread 1 could never process incoming data on `ch_B.res` — even though data might already be sitting there. This is a deadlock: Thread 1 has work to do but can't run because Thread 0 is blocking the shared loop on an unrelated channel.
+
+Parking avoids this. Thread 0's recv is removed from the heap and stored separately, letting the run loop continue to process Thread 1's events. When data arrives on `ch_A`, `try_unpark()` moves Thread 0's recv back into the heap.
+
+**Empty heap with parked events**: If a proc has only one logical thread (e.g. a simple `loop { recv >> ... }`) and its recv parks, the heap becomes empty. The run loop detects this and waits on the channel's condvar instead of exiting, so the proc stays alive until the sender writes data and wakes it up.
+
 The main loop calls `try_unpark()` after each event batch. This scans all parked events and checks if their channel conditions are now satisfied:
 - Parked recv: is there data in the slot?
 - Parked send: is the slot empty?
