@@ -165,7 +165,24 @@ impl Simulator {
     /// Run the simulation until DebugFinish or heap is empty.
     pub fn run(&mut self) {
         while !self.state.finished && !self.global_finished.load(Ordering::SeqCst) {
-            let Some(Reverse((cycle, event_id, thread_idx))) = self.state.heap.pop() else { break };
+            // If heap is empty but events are parked, wait for channel activity
+            // instead of exiting. This handles edge cases
+            // that have no background thread to keep the heap populated.
+            if self.state.heap.is_empty() {
+                if self.state.parked.is_empty() { break; }
+                
+                self.state.try_unpark(&self.channel_table, &self.global_finished);
+                if self.state.heap.is_empty() {
+                    let endpoint = match &self.state.parked[0].kind {
+                        ParkedKind::Recv { endpoint, .. } | ParkedKind::Send { endpoint, .. } => endpoint.clone(),
+                    };
+                    let handler = self.channel_table.get(&endpoint).unwrap();
+                    let ch = handler.inner.lock().unwrap();
+                    let _ = handler.condvar.wait_timeout(ch, std::time::Duration::from_millis(1)).unwrap();
+                    continue;
+                }
+            }
+            let Reverse((cycle, event_id, thread_idx)) = self.state.heap.pop().unwrap();
 
             if let Some(max) = self.max_cycles {
                 if cycle >= max {
