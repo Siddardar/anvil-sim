@@ -8,6 +8,19 @@ use super::eval::eval_wire;
 /// Wrapped in Reverse so BinaryHeap acts as a min-heap.
 type QueueEntry = Reverse<(usize, usize, usize)>;
 
+/// A channel event that couldn't complete immediately (non-blocking parking)
+struct ParkedEvent {
+    succ_id: usize,
+    thread_idx: usize,
+    cycle: usize,
+    kind: ParkedKind,
+}
+
+enum ParkedKind {
+    Recv { endpoint: String, msg: String },
+    Send { endpoint: String, msg: String, value: isize },
+}
+
 /// Holds all the wires and events associated with a thread
 struct ThreadState {
     /// Wire lookup by id
@@ -32,16 +45,53 @@ pub struct ChannelHandler {
 pub type ChannelTable = HashMap<String, Arc<ChannelHandler>>;
 pub type GlobalFinished = Arc<AtomicBool>;
 
+/// Read `len` bits from a byte array starting at bit `offset`, returned as isize (max 64 bits).
+pub fn read_reg_bits(data: &[u8], offset: usize, len: usize) -> isize {
+    let mut result: isize = 0;
+    for i in 0..len.min(64) {
+        let bit_pos = offset + i;
+        let byte_idx = bit_pos / 8;
+        let bit_idx = bit_pos % 8;
+        if byte_idx < data.len() && data[byte_idx] & (1 << bit_idx) != 0 {
+            result |= 1isize << i;
+        }
+    }
+    result
+}
+
+/// Write `len` bits of `value` into a byte array at bit `offset`.
+fn write_reg_bits(data: &mut Vec<u8>, offset: usize, len: usize, value: isize) {
+    let max_byte = (offset + len + 7) / 8;
+    if data.len() < max_byte {
+        data.resize(max_byte, 0);
+    }
+    for i in 0..len {
+        let bit_pos = offset + i;
+        let byte_idx = bit_pos / 8;
+        let bit_idx = bit_pos % 8;
+        if i < 64 && value & (1isize << i) != 0 {
+            data[byte_idx] |= 1u8 << bit_idx;
+        } else {
+            data[byte_idx] &= !(1u8 << bit_idx);
+        }
+    }
+}
+
 /// Shared mutable simulation state (separate from threads for split borrowing)
 struct SimState {
-    /// Current register values (what RegRead sees)
-    regs: HashMap<String, isize>,
-    /// Buffered register writes, applied when cycle advances
-    pending_writes: Vec<(String, isize)>,
+    /// Current register values stored as byte arrays (supports arbitrary widths)
+    regs: HashMap<String, Vec<u8>>,
+    /// Buffered register writes: (reg_name, bit_offset, bit_size, value)
+    pending_writes: Vec<(String, usize, usize, isize)>,
     /// Min-heap event queue
     heap: BinaryHeap<QueueEntry>,
     /// Set to true when DebugFinish is hit
     finished: bool,
+    /// Events waiting on channel data
+    parked: Vec<ParkedEvent>,
+    /// Cached values from SeqRecv events so downstream wires can still read them
+    /// after the channel slot is cleared. Keyed by (endpoint, msg).
+    recv_cache: HashMap<(String, String), isize>,
 }
 
 pub struct Simulator {
@@ -82,7 +132,10 @@ impl Simulator {
                     .map(|s| s.parse::<isize>().expect("invalid reg init"))
                     .unwrap_or(0);
 
-                regs.insert(reg.name, reg_val);
+                let entry = regs.entry(reg.name).or_insert_with(Vec::new);
+                if reg_val != 0 {
+                    write_reg_bits(entry, 0, 64, reg_val);
+                }
             }
 
             threads.push(ThreadState {
@@ -103,6 +156,8 @@ impl Simulator {
                 regs, heap,
                 pending_writes: Vec::new(),
                 finished: false,
+                parked: Vec::new(),
+                recv_cache: HashMap::new(),
             },
         }
     }
@@ -123,10 +178,15 @@ impl Simulator {
             }
 
             self.state.fire_event(&mut self.threads[thread_idx], cycle, event_id, thread_idx, &self.proc_name, &self.channel_table, &self.global_finished);
-            while let Some(Reverse((next_cycle, _, _))) = self.state.heap.peek() {
-                if *next_cycle != cycle { break; }
-                let Reverse((_, next_id, next_thread_idx)) = self.state.heap.pop().unwrap();
-                self.state.fire_event(&mut self.threads[next_thread_idx], cycle, next_id, next_thread_idx, &self.proc_name, &self.channel_table, &self.global_finished);
+            loop {
+                self.state.try_unpark(&self.channel_table, &self.global_finished);
+                match self.state.heap.peek() {
+                    Some(Reverse((next_cycle, _, _))) if *next_cycle == cycle => {
+                        let Reverse((_, next_id, next_thread_idx)) = self.state.heap.pop().unwrap();
+                        self.state.fire_event(&mut self.threads[next_thread_idx], cycle, next_id, next_thread_idx, &self.proc_name, &self.channel_table, &self.global_finished);
+                    }
+                    _ => break,
+                }
             }
 
             self.state.apply_pending_writes();
@@ -137,14 +197,39 @@ impl Simulator {
 impl SimState {
     /// Fire a single event.
     fn fire_event(
-        &mut self, thread: &mut ThreadState, cycle: usize, event_id: usize, 
-        thread_idx: usize, proc_name: &str, channel_table: &ChannelTable, 
-        global_finished: &GlobalFinished) {  
+        &mut self, thread: &mut ThreadState, cycle: usize, event_id: usize,
+        thread_idx: usize, proc_name: &str, channel_table: &ChannelTable,
+        global_finished: &GlobalFinished) {
 
         if self.finished { return; }
+
+        // Snapshot received channel data into recv_cache before executing.
+        // This lets downstream wire evaluations (including from parked events
+        // that fire later) access the received value after the channel is cleared.
+        if let EventSource::SeqRecv { endpoint, msg, .. } = &thread.events[event_id].source {
+            let handler = channel_table.get(endpoint)
+                .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
+            let ch = handler.inner.lock().unwrap();
+            if let Some(Some(val)) = ch.data.get(msg) {
+                self.recv_cache.insert((endpoint.clone(), msg.clone()), *val);
+            }
+        }
+
         self.execute_actions(thread, event_id, proc_name, channel_table, global_finished);
         if self.finished { return; }
+
         self.schedule_successors(thread, cycle, event_id, thread_idx, proc_name, channel_table, global_finished);
+
+        // After a SeqRecv event's actions have read the data, clear the channel
+        // so the sender can send again on the next iteration
+        if let EventSource::SeqRecv { endpoint, msg, .. } = &thread.events[event_id].source {
+            let handler = channel_table.get(endpoint)
+                .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
+            let mut ch = handler.inner.lock().unwrap();
+            ch.data.insert(msg.clone(), None);
+            drop(ch);
+            handler.condvar.notify_all();
+        }
     }
 
     /// Execute actions for an event.
@@ -157,7 +242,7 @@ impl SimState {
         // execute all ImmediateSend actions first
         for action in &event.actions {
             if let Action::ImmediateSend { endpoint, msg, value } = action {
-                let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished);
+                let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished, &self.recv_cache);
                 let handler = channel_table.get(endpoint)
                     .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
                 let mut ch = handler.inner.lock().unwrap();
@@ -184,25 +269,21 @@ impl SimState {
                 },
                 Action::DebugPrint { fmt, args } => {
                     let values: Vec<isize> = args.iter()
-                        .map(|ld| eval_wire(ld.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished))
+                        .map(|ld| eval_wire(ld.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished, &self.recv_cache))
                         .collect();
                     println!("{}", Self::format_dprint(fmt, &values));
                 },
                 Action::RegAssign { target, value } => {
-                    let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished);
+                    let val = eval_wire(value.wire_id.unwrap(), wires, &self.regs, proc_name, channel_table, global_finished, &self.recv_cache);
 
                     let offset =
                         if target.offset_is_const {
-                            target.offset as isize
+                            target.offset
                         } else {
-                            eval_wire(target.offset, wires, &self.regs, proc_name, channel_table, global_finished)
+                            eval_wire(target.offset, wires, &self.regs, proc_name, channel_table, global_finished, &self.recv_cache) as usize
                         };
 
-                    let mask = ((1isize << target.size as isize) - 1) << offset;
-                    let current = *self.regs.get(&target.reg).unwrap_or(&0);
-                    let new_val = (current & !mask) | ((val << offset) & mask);
-
-                    self.pending_writes.push((target.reg.clone(), new_val));
+                    self.pending_writes.push((target.reg.clone(), offset, target.size, val));
                 },
                 _ => todo!(),
             }
@@ -234,7 +315,7 @@ impl SimState {
                     self.heap.push(Reverse((cycle + *cycles, succ_id, thread_idx)));
                 },
                 EventSource::RootBranch { branch_sel, cond_wire_id, branch_cond, .. } => {
-                    let cond_val = eval_wire(cond_wire_id.unwrap(), &thread.wires, &self.regs, proc_name, channel_table, global_finished);
+                    let cond_val = eval_wire(cond_wire_id.unwrap(), &thread.wires, &self.regs, proc_name, channel_table, global_finished, &self.recv_cache);
                     let should_fire = match branch_cond {
                         BranchCond::TrueFalse(_) => {
                             (*branch_sel == 0 && cond_val != 0) || (*branch_sel == 1 && cond_val == 0)
@@ -242,7 +323,7 @@ impl SimState {
                         BranchCond::MatchCases { patterns } => {
                             let pat_val = eval_wire(
                                 patterns[*branch_sel].wire_id.unwrap(),
-                                &thread.wires, &self.regs, proc_name, channel_table, global_finished,
+                                &thread.wires, &self.regs, proc_name, channel_table, global_finished, &self.recv_cache,
                             );
                             cond_val == pat_val
                         },
@@ -272,37 +353,40 @@ impl SimState {
                         })
                         .expect("no SustainedSend for SeqSend");
 
-                    let val = eval_wire(wire_id, &thread.wires, &self.regs, proc_name, channel_table, global_finished);
+                    let val = eval_wire(wire_id, &thread.wires, &self.regs, proc_name, channel_table, global_finished, &self.recv_cache);
                     let handler = channel_table.get(endpoint)
                         .unwrap_or_else(|| panic!("no channel for endpoint {}", endpoint));
-                    
-                    let mut ch = handler.inner.lock().unwrap();
-                    while ch.data.get(msg).copied().flatten().is_some() {
-                        if global_finished.load(Ordering::SeqCst) { return; }
 
-                        ch = handler.condvar.wait(ch).unwrap();
+                    let ch = handler.inner.lock().unwrap();
+                    if ch.data.get(msg).copied().flatten().is_none() {
+                        let mut ch = ch;
+                        ch.data.insert(msg.clone(), Some(val));
+                        drop(ch);
+                        handler.condvar.notify_all();
+                        self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
+                    } else {
+                        drop(ch);
+                        self.parked.push(ParkedEvent {
+                            succ_id, thread_idx, cycle,
+                            kind: ParkedKind::Send { endpoint: endpoint.clone(), msg: msg.clone(), value: val },
+                        });
                     }
-
-                    ch.data.insert(msg.clone(), Some(val));
-                    drop(ch);
-
-                    handler.condvar.notify_all();
-
-                    self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
                 },
                 EventSource::SeqRecv { endpoint, msg, .. } => {
                     let handler = channel_table.get(endpoint)
                         .unwrap_or_else(|| panic!("no channel for endpoint {}", endpoint));
 
-                    let mut ch = handler.inner.lock().unwrap();
-                    while ch.data.get(msg).copied().flatten().is_none() {
-                        if global_finished.load(Ordering::SeqCst) { return; }
-                        ch = handler.condvar.wait(ch).unwrap();
+                    let ch = handler.inner.lock().unwrap();
+                    if ch.data.get(msg).copied().flatten().is_some() {
+                        drop(ch);
+                        self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
+                    } else {
+                        drop(ch);
+                        self.parked.push(ParkedEvent {
+                            succ_id, thread_idx, cycle,
+                            kind: ParkedKind::Recv { endpoint: endpoint.clone(), msg: msg.clone() },
+                        });
                     }
-
-                    drop(ch);
-
-                    self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
                 }
                 _ => todo!(),
             }
@@ -314,10 +398,49 @@ impl SimState {
         }
     }
 
+    /// Check parked events and re-enqueue any that can now proceed.
+    fn try_unpark(&mut self, channel_table: &ChannelTable, global_finished: &GlobalFinished) {
+        let mut made_progress = true;
+        while made_progress {
+            made_progress = false;
+            let mut i = 0;
+            while i < self.parked.len() {
+                if global_finished.load(Ordering::SeqCst) { return; }
+                let ready = match &self.parked[i].kind {
+                    ParkedKind::Recv { endpoint, msg } => {
+                        let handler = channel_table.get(endpoint).unwrap();
+                        let ch = handler.inner.lock().unwrap();
+                        ch.data.get(msg).copied().flatten().is_some()
+                    }
+                    ParkedKind::Send { endpoint, msg, .. } => {
+                        let handler = channel_table.get(endpoint).unwrap();
+                        let ch = handler.inner.lock().unwrap();
+                        ch.data.get(msg).copied().flatten().is_none()
+                    }
+                };
+                if ready {
+                    let p = self.parked.remove(i);
+                    if let ParkedKind::Send { ref endpoint, ref msg, value } = p.kind {
+                        let handler = channel_table.get(endpoint).unwrap();
+                        let mut ch = handler.inner.lock().unwrap();
+                        ch.data.insert(msg.clone(), Some(value));
+                        drop(ch);
+                        handler.condvar.notify_all();
+                    }
+                    self.heap.push(Reverse((p.cycle, p.succ_id, p.thread_idx)));
+                    made_progress = true;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
     /// Apply pending register writes.
     fn apply_pending_writes(&mut self) {
-        for (reg_name, val) in self.pending_writes.drain(..) {
-            self.regs.insert(reg_name, val);
+        for (reg_name, offset, size, val) in self.pending_writes.drain(..) {
+            let data = self.regs.entry(reg_name).or_insert_with(Vec::new);
+            write_reg_bits(data, offset, size, val);
         }
     }
 

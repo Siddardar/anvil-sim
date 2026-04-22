@@ -163,7 +163,7 @@ pub enum WireSource {
     /// e.g. #{a, b} where a=0b11 (2-bit), b=0b01 (2-bit) => 0b1101 (4-bit)
     Concat { wires: Vec<usize> },
     /// Extract a range of bits: wire[offset+:len]. Offset can be constant or wire id.
-    Slice { wire: usize, offset: serde_json::Value, len: usize },
+    Slice { wire: usize, offset: usize, len: usize, offset_is_const: bool },
     /// Match a wire value against patterns. First matching pattern's val is returned, else default wire value.
     /// Like a switch/case or match statement.
     Cases { value: usize, cases: Vec<SwitchCase>, default: usize },
