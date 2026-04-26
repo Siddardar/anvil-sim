@@ -504,9 +504,10 @@ impl SimState {
 
             // If last version is at this cycle, mutate in place (multiple writes same cycle)
             // Otherwise, clone latest as base for new version
-            if versions.last().map_or(true, |(c, _)| *c != cycle) {
+            let commit_cycle = cycle + 1;
+            if versions.last().map_or(true, |(c, _)| *c != commit_cycle) {
                 let base = versions.last().map(|(_, b)| b.clone()).unwrap_or_default();
-                versions.push((cycle, base));
+                versions.push((commit_cycle, base));
             }
 
             let current = &mut versions.last_mut().unwrap().1;
@@ -552,11 +553,25 @@ impl SimState {
                         res.push_str(&format!("{:>2}", values[val_idx]));
                         val_idx += 1;
                     }
+                    Some('b') => {
+
+                        res.push_str(&format!("{:b}", values[val_idx]));
+                        val_idx += 1;
+                    }
                     Some(other) => {
                         res.push('%');
                         res.push(other);
                     }
                     None => res.push('%')
+                }
+            } else if c == '\\' {
+                match chars.next() {
+                    Some('n') => res.push('\n'),
+                    Some(other) => {
+                        res.push('\\');
+                        res.push(other);
+                    }
+                    None => res.push('\\'),
                 }
             } else {
                 res.push(c)
