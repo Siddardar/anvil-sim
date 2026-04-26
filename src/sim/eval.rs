@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use crate::ir::types::*;
-use super::engine::{ChannelTable, GlobalFinished, read_reg_bits};
+use super::engine::{ChannelTable, GlobalFinished, read_reg_bits, read_reg_at_cycle};
 
 /// Evaluate a wire by id, recursively resolving dependencies.
 /// `wires` maps wire id -> Wire definition.
@@ -8,7 +8,8 @@ use super::engine::{ChannelTable, GlobalFinished, read_reg_bits};
 pub fn eval_wire(
     wire_id: usize,
     wires: &Vec<Wire>,
-    regs: &HashMap<String, Vec<u8>>,
+    regs: &HashMap<String, Vec<(usize, Vec<u8>)>>,
+    cycle: usize,
     proc_name: &str,
     channel_table: &ChannelTable,
     global_finished: &GlobalFinished,
@@ -19,52 +20,53 @@ pub fn eval_wire(
         WireSource::Literal { value, width:_ } => *value,
 
         WireSource::RegRead { reg } => {
-            let data = regs.get(reg).map(|v| v.as_slice()).unwrap_or(&[]);
+            let versions = regs.get(reg).map(|v| v.as_slice()).unwrap_or(&[]);
+            let data = read_reg_at_cycle(versions, cycle);
             read_reg_bits(data, 0, current_wire.size.min(64))
         },
 
         WireSource::Binary { op, left, right } => {
-            let left_val = eval_wire(*left, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+            let left_val = eval_wire(*left, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
             // TODO: right can also be an array of ids where you check if left val
             // is equal to one of the wire ids vals on the right.
             let right_id = right.as_u64().expect("expected single wire id") as usize;
-            let right_val = eval_wire(right_id, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+            let right_val = eval_wire(right_id, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
             eval_bin_op(op, left_val, right_val)
         },
 
         WireSource::Unary { op, operand } => {
             let operand_wire = wires.get(*operand).expect("unknown wire id");
             let operand_size = operand_wire.size;
-            let operand_val = eval_wire(*operand, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+            let operand_val = eval_wire(*operand, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
             eval_un_op(op, operand_val, operand_size)
         },
 
         WireSource::Switch { cases, default } => {
             for case in cases {
-                let cond_val = eval_wire(case.cond, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+                let cond_val = eval_wire(case.cond, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
                 if cond_val != 0 {
-                    return eval_wire(case.val, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+                    return eval_wire(case.val, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
                 }
             }
-            eval_wire(*default, wires, regs, proc_name, channel_table, global_finished, recv_cache)
+            eval_wire(*default, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache)
         },
 
         WireSource::Cases { value, cases, default } => {
-            let match_val = eval_wire(*value, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+            let match_val = eval_wire(*value, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
             for case in cases {
-                let pat_val = eval_wire(case.cond, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+                let pat_val = eval_wire(case.cond, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
                 if match_val == pat_val {
-                    return eval_wire(case.val, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+                    return eval_wire(case.val, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
                 }
             }
-            eval_wire(*default, wires, regs, proc_name, channel_table, global_finished, recv_cache)
+            eval_wire(*default, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache)
         },
 
         WireSource::Concat { wires: wire_ids } => {
             let mut result: isize = 0;
             for &wid in wire_ids {
                 let w = wires.get(wid).expect("unknown wire id");
-                let val = eval_wire(wid, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+                let val = eval_wire(wid, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
                 if w.size >= 64 {
                     result = val;
                 } else {
@@ -78,15 +80,16 @@ pub fn eval_wire(
             let off = if *offset_is_const {
                 *offset
             } else {
-                eval_wire(*offset, wires, regs, proc_name, channel_table, global_finished, recv_cache) as usize
+                eval_wire(*offset, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache) as usize
             };
 
             // For RegRead inputs, read directly from byte array (handles wide registers)
             if let WireSource::RegRead { reg } = &wires[*wire].source {
-                let data = regs.get(reg).map(|v| v.as_slice()).unwrap_or(&[]);
+                let versions = regs.get(reg).map(|v| v.as_slice()).unwrap_or(&[]);
+                let data = read_reg_at_cycle(versions, cycle);
                 read_reg_bits(data, off, *len)
             } else {
-                let wire_val = eval_wire(*wire, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+                let wire_val = eval_wire(*wire, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
                 if off >= 64 {
                     0
                 } else if *len >= 64 {
@@ -98,9 +101,9 @@ pub fn eval_wire(
         },
 
         WireSource::Update { base, updates } => {
-            let mut result = eval_wire(*base, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+            let mut result = eval_wire(*base, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
             for update in updates {
-                let val = eval_wire(update.wire, wires, regs, proc_name, channel_table, global_finished, recv_cache);
+                let val = eval_wire(update.wire, wires, regs, cycle, proc_name, channel_table, global_finished, recv_cache);
                 if update.offset + update.size <= 64 {
                     let mask = ((1isize << update.size) - 1) << update.offset;
                     result = (result & !mask) | ((val << update.offset) & mask);
