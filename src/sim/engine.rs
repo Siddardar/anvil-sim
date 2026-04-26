@@ -219,6 +219,13 @@ impl Simulator {
             }
 
             self.state.apply_pending_writes(cycle);
+
+            // clear old values every 100 cycles? TODO: see how it performs
+            if cycle % 100 == 0 {
+                if let Some(min_cycle) = self.state.min_active_cycle() {
+                    self.state.gc_versions(min_cycle);
+                }
+            }
         }
     }
 }
@@ -504,6 +511,32 @@ impl SimState {
 
             let current = &mut versions.last_mut().unwrap().1;
             write_reg_bits(current, offset, size, val);
+        }
+    }
+
+    /// Helper to check the lowest cycle amongst all threads
+    fn min_active_cycle(&self) -> Option<usize> {
+        let heap_min = self.heap.peek().map(|Reverse((c, _, _))| *c);
+        let parked_min = self.parked.iter().map(|p| p.cycle).min();
+        match (heap_min, parked_min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// garbage collection to remove old register values
+    fn gc_versions(&mut self, min_cycle: usize) {
+        for versions in self.regs.values_mut() {
+            if versions.len() <= 1 { continue; }
+            
+            // Discard everything older than versions at or before min cycle
+            let keep_from = match versions.partition_point(|(c, _)| *c <= min_cycle) {
+                0 => 0, 
+                i => i - 1,
+            };
+            if keep_from > 0 {
+                versions.drain(..keep_from);
+            }
         }
     }
 
