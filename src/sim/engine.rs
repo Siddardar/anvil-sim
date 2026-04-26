@@ -403,12 +403,14 @@ impl SimState {
 
                     let ch = handler.inner.lock().unwrap();
                     if ch.data.get(msg).copied().flatten().is_none() {
+                        let recv_ts = ch.recv_timestamps.get(msg).copied().unwrap_or(cycle);
+                        let fire_cycle = cycle.max(recv_ts);
                         let mut ch = ch;
                         ch.data.insert(msg.clone(), Some(val));
-                        ch.send_timestamps.insert(msg.clone(), cycle);
+                        ch.send_timestamps.insert(msg.clone(), fire_cycle);
                         drop(ch);
                         handler.condvar.notify_all();
-                        self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
+                        self.fire_event(thread, fire_cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
                     } else {
                         drop(ch);
                         self.parked.push(ParkedEvent {
@@ -423,8 +425,10 @@ impl SimState {
 
                     let ch = handler.inner.lock().unwrap();
                     if ch.data.get(msg).copied().flatten().is_some() {
+                        let sender_ts = ch.send_timestamps.get(msg).copied().unwrap_or(cycle);
+                        let fire_cycle = cycle.max(sender_ts);
                         drop(ch);
-                        self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
+                        self.fire_event(thread, fire_cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
                     } else {
                         drop(ch);
                         self.parked.push(ParkedEvent {
