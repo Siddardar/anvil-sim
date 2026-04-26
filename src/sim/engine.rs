@@ -35,6 +35,8 @@ struct ThreadState {
 
 pub struct SharedChannel {
     pub data: HashMap<String, Option<isize>>, // msg name -> val
+    pub send_timestamps: HashMap<String, usize>, // msg_name -> cycle_num for parked recvs
+    pub recv_timestamps: HashMap<String, usize>, // msg_name -> cycle_num for parked sends
 }
 
 pub struct ChannelHandler {
@@ -216,7 +218,8 @@ impl SimState {
     fn fire_event(
         &mut self, thread: &mut ThreadState, cycle: usize, event_id: usize,
         thread_idx: usize, proc_name: &str, channel_table: &ChannelTable,
-        global_finished: &GlobalFinished) {
+        global_finished: &GlobalFinished
+    ) {
 
         if self.finished { return; }
 
@@ -232,7 +235,7 @@ impl SimState {
             }
         }
 
-        self.execute_actions(thread, event_id, proc_name, channel_table, global_finished);
+        self.execute_actions(thread, event_id, proc_name, channel_table, global_finished, cycle);
         if self.finished { return; }
 
         self.schedule_successors(thread, cycle, event_id, thread_idx, proc_name, channel_table, global_finished);
@@ -244,6 +247,7 @@ impl SimState {
                 .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
             let mut ch = handler.inner.lock().unwrap();
             ch.data.insert(msg.clone(), None);
+            ch.recv_timestamps.insert(msg.clone(), cycle);
             drop(ch);
             handler.condvar.notify_all();
         }
@@ -252,7 +256,11 @@ impl SimState {
     /// Execute actions for an event.
     /// ImmediateSend actions run first so channel data is available
     /// before any MessagePort wire evaluations block.
-    fn execute_actions(&mut self, thread: &ThreadState, event_id: usize, proc_name: &str, channel_table: &ChannelTable, global_finished: &GlobalFinished) {
+    fn execute_actions(
+        &mut self, thread: &ThreadState, event_id: usize, proc_name: &str, 
+        channel_table: &ChannelTable, global_finished: &GlobalFinished,
+        cycle: usize,
+    ) {
         let event = &thread.events[event_id];
         let wires = &thread.wires;
 
@@ -268,11 +276,12 @@ impl SimState {
                     ch = handler.condvar.wait(ch).unwrap();
                 }
                 ch.data.insert(msg.clone(), Some(val));
+                ch.send_timestamps.insert(msg.clone(), cycle);
                 handler.condvar.notify_all();
             }
         }
 
-        // Phase 2: execute everything except ImmediateSend and ImmediateRecv
+        // execute everything except ImmediateSend and ImmediateRecv
         for action in &event.actions {
             match action {
                 Action::ImmediateSend { .. } | Action::ImmediateRecv { .. } => {},
@@ -306,13 +315,14 @@ impl SimState {
             }
         }
 
-        // Phase 3: execute all ImmediateRecv last (after MessagePort reads)
+        // execute all ImmediateRecv last (after MessagePort reads)
         for action in &event.actions {
             if let Action::ImmediateRecv { endpoint, msg } = action {
                 let handler = channel_table.get(endpoint)
                     .unwrap_or_else(|| panic!("no channel for endpoint '{}'", endpoint));
                 let mut ch = handler.inner.lock().unwrap();
                 ch.data.insert(msg.clone(), None);
+                ch.recv_timestamps.insert(msg.clone(), cycle);
                 handler.condvar.notify_all();
             }
         }
@@ -378,6 +388,7 @@ impl SimState {
                     if ch.data.get(msg).copied().flatten().is_none() {
                         let mut ch = ch;
                         ch.data.insert(msg.clone(), Some(val));
+                        ch.send_timestamps.insert(msg.clone(), cycle);
                         drop(ch);
                         handler.condvar.notify_all();
                         self.fire_event(thread, cycle, succ_id, thread_idx, proc_name, channel_table, global_finished);
@@ -437,14 +448,30 @@ impl SimState {
                 };
                 if ready {
                     let p = self.parked.remove(i);
+                    let fire_cycle = match &p.kind {
+                        ParkedKind::Recv { endpoint, msg} => {
+                            let handler = channel_table.get(endpoint).unwrap();
+                            let ch = handler.inner.lock().unwrap();
+                            let sender_ts = ch.send_timestamps.get(msg).copied().unwrap_or(p.cycle);
+                            p.cycle.max(sender_ts)
+                        },
+                        ParkedKind::Send { endpoint, msg, ..} => {
+                            let handler = channel_table.get(endpoint).unwrap();
+                            let ch = handler.inner.lock().unwrap();
+                            let recv_ts = ch.recv_timestamps.get(msg).copied().unwrap_or(p.cycle);
+                            p.cycle.max(recv_ts)
+                        }
+                    };
+
                     if let ParkedKind::Send { ref endpoint, ref msg, value } = p.kind {
                         let handler = channel_table.get(endpoint).unwrap();
                         let mut ch = handler.inner.lock().unwrap();
                         ch.data.insert(msg.clone(), Some(value));
+                        ch.send_timestamps.insert(msg.clone(), fire_cycle);
                         drop(ch);
                         handler.condvar.notify_all();
                     }
-                    self.heap.push(Reverse((p.cycle, p.succ_id, p.thread_idx)));
+                    self.heap.push(Reverse((fire_cycle, p.succ_id, p.thread_idx)));
                     made_progress = true;
                 } else {
                     i += 1;

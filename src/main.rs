@@ -106,7 +106,13 @@ fn main() {
         for proc in &procs {
             for ch in &proc.channels {
                 let handler = Arc::new(ChannelHandler {
-                    inner: Mutex::new(SharedChannel { data: HashMap::new() }),
+                    inner: Mutex::new(
+                        SharedChannel { 
+                            data: HashMap::new(),
+                            send_timestamps: HashMap::new(),
+                            recv_timestamps: HashMap::new()
+                        }
+                    ),
                     condvar: Condvar::new(),
                 });
                 base_channel_table.insert(ch.left.clone(), Arc::clone(&handler));
