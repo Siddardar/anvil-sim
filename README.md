@@ -76,7 +76,7 @@ Each proc has a min heap of events ordered by `(cycle, event_id, thread_idx)`. T
 4. Applies pending register writes
 5. Loops
 
-Register writes are buffered during a cycle and applied at the end, so all events within the same cycle see the same register values.
+Register writes are buffered during a cycle and applied at the end (committed as the *next* cycle's version), so all events within the same cycle see the same register values. Registers store a [version history](#register-versioning) so that events replayed at earlier cycles (due to Lamport adjustment) read the correct historical values.
 
 ### Firing an Event
 
@@ -115,9 +115,9 @@ Both endpoints of a channel point to the **same** `Arc<ChannelHandler>`. Spawned
 
 Channel operations use a single-slot protocol: each message name has one `Option<isize>` slot. `SharedChannel` holds a `HashMap<String, Option<isize>>` where each key is a message name like `"req"` or `"res"`. `None` means empty/consumed, `Some(val)` means data is available. The whole struct is behind a `Mutex` inside `ChannelHandler`.
 
-- **Send**: Writes `Some(value)` into the slot. If the slot already has data (previous value not yet consumed), the send **parks**.
+- **Send**: Writes `Some(value)` into the slot and records a `send_timestamp` (the sender's cycle). If the slot already has data (previous value not yet consumed), the send **parks**.
 - **Receive**: Reads `Some(value)` from the slot. If the slot is `None` (no data yet), the receive [parks](#parking).
-- **Clear**: After a receive completes, the slot is set back to `None`, signaling the sender that it can send again.
+- **Clear**: After a receive completes, the slot is set back to `None` and a `recv_timestamp` is recorded, signaling the sender that it can send again.
 
 There are two types of send and receive:
 - `ImmediateSend` / `ImmediateRecv`: executed as event actions (blocking via condvar for cross-proc communication)
@@ -146,11 +146,11 @@ The main loop calls `try_unpark()` after each event batch. This scans all parked
 - Parked recv: is there data in the slot?
 - Parked send: is the slot empty?
 
-If ready, the event is moved back into the heap at its original cycle and will fire on the next iteration.
+If ready, the event's fire cycle is adjusted using [Lamport timestamps](#cycle-accuracy) — `max(parked_cycle, remote_timestamp)` — and pushed back into the heap at the adjusted cycle.
 
 ### The recv_cache
 
-There's a subtle problem: when a `SeqRecv` event fires, it processes the received value and then clears the channel slot (so the sender can send again). 
+When a `SeqRecv` event fires, it processes the received value and then clears the channel slot (so the sender can send again). 
 
 But some successor events may be parked on a different channel. When those successors eventually fire, their wire evaluations may reference a `MessagePort` wire that reads from the already-cleared channel, causing a deadlock.
 
@@ -167,8 +167,50 @@ When an event fires, this is the full call chain:
 3. `schedule_successors()` looks at the event's **successor edges** and decides what to do with each one based on its source type:
    - `SeqCycles` → pushed onto the heap for a future cycle
    - `Branch` / `RootBranch` → evaluates a condition wire (calling `eval_wire` again) and immediately fires the matching branch
-   - `SeqRecv` → checks the channel: if data is present, fires immediately; if not, parks the event (no wire evaluation happens, avoiding the `MessagePort` block)
-   - `SeqSend` → evaluates the value wire to compute what to send, then checks the channel: if the slot is empty, writes the data and fires immediately; if full, parks with the pre-computed value
+   - `SeqRecv` → checks the channel: if data is present, applies [Lamport adjustment](#cycle-accuracy) using `send_timestamps` and fires at the adjusted cycle; if not, parks the event (no wire evaluation happens, avoiding the `MessagePort` block)
+   - `SeqSend` → evaluates the value wire to compute what to send, then checks the channel: if the slot is empty, applies [Lamport adjustment](#cycle-accuracy) using `recv_timestamps`, writes the data, and fires at the adjusted cycle; if full, parks with the pre-computed value
 4. After all same-cycle events fire, `apply_pending_writes()` commits buffered register writes
 
 The key distinction: actions block on missing channel data (via `condvar.wait` inside `eval_wire`), while SeqSend/SeqRecv successors avoid blocking by parking instead. `SeqSend` does evaluate the value wire before deciding to park — so if that wire depends on a `MessagePort`, it can still block. But the channel check itself (is the slot free?) is non-blocking.
+
+## Cycle Accuracy
+
+Procs run on independent OS threads with independent heaps and cycle counters. Without synchronization, two problems arise:
+
+1. **Cross-proc drift**: A sender at cycle $n$ delivers to a receiver whose heap is at cycle $m$. The receiver processes the data as if it arrived at cycle $m$.
+2. **Within-proc racing**: When a proc has multiple logical threads (e.g., a `cycle_counter` loop + a `recv` loop), the fast thread races ahead while the other is parked. When the parked thread unparks, shared registers have values from far in the future.
+
+### Lamport Timestamps
+
+`SharedChannel` carries per-message timestamps alongside the data:
+
+```rust
+pub struct SharedChannel {
+    pub data: HashMap<String, Option<isize>>,
+    pub send_timestamps: HashMap<String, usize>,  // cycle when data was written
+    pub recv_timestamps: HashMap<String, usize>,   // cycle when data was cleared
+}
+```
+
+Timestamps are recorded at every send/recv point (ImmediateSend, ImmediateRecv, SeqSend, SeqRecv clear). When an event is ready to proceed, via `try_unpark` or directly in `schedule_successors`, its fire cycle is adjusted:
+
+- **Recv unparking/firing**: `fire_cycle = max(local_cycle, send_timestamp)` the receiver fires no earlier than when the sender wrote the data.
+- **Send unparking/firing**: `fire_cycle = max(local_cycle, recv_timestamp)` the sender fires no earlier than when the receiver cleared the slot.
+
+This adjustment applies in both code paths: when an event parks and later unparks via `try_unpark`, and when a `SeqRecv`/`SeqSend` finds data/slot immediately available in `schedule_successors`. The latter case is important because OS thread scheduling can cause data to arrive before the receiver even checks and without a Lamport adjustment, the fire cycle would depend on thread timing.
+
+Propagation is automatic: once a recv unparks at adjusted cycle $C$, all its successor events fire at $C+N$. Any subsequent sends carry timestamp $C+N$, propagating the correct cycle value across procs.
+
+### Register Versioning
+
+Registers store a version history instead of a single value:
+
+```rust
+regs: HashMap<String, Vec<(usize, Vec<u8>)>>  // name -> [(visible_at_cycle, bytes)] sorted ascending
+```
+
+Each entry `(C, bytes)` means "this value is visible starting at cycle C." When an event fires at cycle N, `read_reg_at_cycle(versions, N)` uses binary search to find the latest version with `cycle <= N`.
+
+**Write semantics**: `apply_pending_writes(cycle)` tags new versions at `cycle + 1`, matching RTL semantics where register writes are visible the cycle after they're committed. This prevents a within-proc race where Thread A's write at cycle N is incorrectly visible to Thread B also firing at cycle N.
+
+**Garbage collection**: To prevent unbounded memory growth, `gc_versions` runs every 100 cycles. It computes the minimum cycle across all heap and parked events, and discards versions older than that (keeping one version before the minimum as a read base).
