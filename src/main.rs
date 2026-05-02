@@ -3,7 +3,7 @@ mod sim;
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::{Arc, Mutex, Condvar, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, AtomicIsize}};
 use ir::types::*;
 use sim::engine::{ChannelTable, SharedChannel, ChannelHandler};
 
@@ -135,6 +135,7 @@ fn main() {
         }
 
         let global_finished = Arc::new(AtomicBool::new(false));
+        let proc_done_count = Arc::new(AtomicIsize::new(procs.len() as isize));
 
         let handles: Vec<_> = procs.into_iter().map(|proc| {
             let mut ct = base_channel_table.clone();
@@ -147,8 +148,16 @@ fn main() {
             }
             let ct = Arc::new(ct);
             let gf = Arc::clone(&global_finished);
+            let proc_done_count = Arc::clone(&proc_done_count);
             std::thread::spawn(move || {
-                let mut sim = sim::engine::Simulator::new(proc.name, proc.threads, ct, gf, max_cycles);
+                let mut sim = sim::engine::Simulator::new(
+                    proc.name, 
+                    proc.threads, 
+                    ct, 
+                    gf, 
+                    max_cycles,
+                    proc_done_count,
+                );
                 sim.run();
             })
         }).collect();

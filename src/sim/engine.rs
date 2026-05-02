@@ -1,5 +1,5 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering, AtomicIsize}};
 use std::cmp::Reverse;
 use crate::ir::types::*;
 use super::eval::eval_wire;
@@ -108,13 +108,22 @@ pub struct Simulator {
     channel_table: Arc<ChannelTable>,
     global_finished: GlobalFinished,
     max_cycles: Option<usize>,
+    proc_done_count: Arc<AtomicIsize>,
+    hit_max_cycles: bool,
     threads: Vec<ThreadState>,
     state: SimState,
 }
 
 impl Simulator {
     /// Build a simulator from a single-proc IR.
-    pub fn new (proc_name: String, proc_threads: Vec<EventGraph>, channel_table: Arc<ChannelTable>, global_finished: GlobalFinished, max_cycles: Option<usize>) -> Self {
+    pub fn new (
+        proc_name: String, 
+        proc_threads: Vec<EventGraph>, 
+        channel_table: Arc<ChannelTable>, 
+        global_finished: GlobalFinished, 
+        max_cycles: Option<usize>,
+        proc_done_count: Arc<AtomicIsize>,
+    ) -> Self {
         let mut heap = BinaryHeap::new();
 
         let mut regs = HashMap::new();
@@ -163,6 +172,8 @@ impl Simulator {
             channel_table,
             global_finished,
             max_cycles,
+            proc_done_count,
+            hit_max_cycles: false,
             threads,
             state: SimState {
                 regs, heap,
@@ -182,7 +193,12 @@ impl Simulator {
             // that have no background thread to keep the heap populated.
             if self.state.heap.is_empty() {
                 if self.state.parked.is_empty() { break; }
-                
+
+                // If we've hit max_cycles and all peers are done, no point waiting
+                if self.hit_max_cycles && self.proc_done_count.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+
                 self.state.try_unpark(&self.channel_table, &self.global_finished);
                 if self.state.heap.is_empty() {
                     let endpoint = match &self.state.parked[0].kind {
@@ -198,9 +214,51 @@ impl Simulator {
 
             if let Some(max) = self.max_cycles {
                 if cycle >= max {
-                    self.global_finished.store(true, Ordering::SeqCst);
-                    for handler in self.channel_table.values() {
-                        handler.condvar.notify_all();
+                    if !self.hit_max_cycles {
+                        self.hit_max_cycles = true;
+                        self.proc_done_count.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    // Drain any parked events below max before exiting.
+                    // Peers may have already sent data that we haven't picked up yet.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    while self.state.parked.iter().any(|p| p.cycle < max) && !self.state.finished {
+                        if self.proc_done_count.load(Ordering::SeqCst) == 0
+                            && std::time::Instant::now() >= deadline { break; }
+
+                        self.state.try_unpark(&self.channel_table, &self.global_finished);
+
+                        // Process any unparked events below max
+                        let mut progress = false;
+                        while let Some(&Reverse((c, _, _))) = self.state.heap.peek() {
+                            if c >= max { self.state.heap.pop(); continue; }
+                            let Reverse((c, eid, tidx)) = self.state.heap.pop().unwrap();
+                            self.state.fire_event(&mut self.threads[tidx], c, eid, tidx, &self.proc_name, &self.channel_table, &self.global_finished);
+                            progress = true;
+                            // fire all same-cycle events
+                            loop {
+                                self.state.try_unpark(&self.channel_table, &self.global_finished);
+                                match self.state.heap.peek() {
+                                    Some(&Reverse((nc, _, _))) if nc == c && nc < max => {
+                                        let Reverse((_, nid, ntidx)) = self.state.heap.pop().unwrap();
+                                        self.state.fire_event(&mut self.threads[ntidx], c, nid, ntidx, &self.proc_name, &self.channel_table, &self.global_finished);
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            self.state.apply_pending_writes(c);
+                        }
+                        if progress { continue; }
+
+                        // Nothing to process yet — wait briefly for peer data
+                        if let Some(parked) = self.state.parked.iter().find(|p| p.cycle < max) {
+                            let endpoint = match &parked.kind {
+                                ParkedKind::Recv { endpoint, .. } | ParkedKind::Send { endpoint, .. } => endpoint.clone(),
+                            };
+                            if let Some(handler) = self.channel_table.get(&endpoint) {
+                                let ch = handler.inner.lock().unwrap();
+                                let _ = handler.condvar.wait_timeout(ch, std::time::Duration::from_millis(5)).unwrap();
+                            }
+                        }
                     }
                     break;
                 }
