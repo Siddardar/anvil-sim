@@ -2,6 +2,10 @@
 
 An event-driven simulator for Anvil programs. Instead of compiling to SystemVerilog and running through Verilator, anvil-sim runs the Anvil's event graph, by compiling it into a JSON IR, directly in Rust.
 
+**NOTE:** For [known issues](#known-issues) see below
+
+See [benchmarks/README.md](benchmarks/README.md) for instructions on building and running the Docker-based benchmark suite (anvil-sim vs Verilator).
+
 ## Overview
 Using `cache.anvil` as an example
 ```
@@ -214,3 +218,7 @@ Each entry `(C, bytes)` means "this value is visible starting at cycle C." When 
 **Write semantics**: `apply_pending_writes(cycle)` tags new versions at `cycle + 1`, matching RTL semantics where register writes are visible the cycle after they're committed. This prevents a within-proc race where Thread A's write at cycle N is incorrectly visible to Thread B also firing at cycle N.
 
 **Garbage collection**: To prevent unbounded memory growth, `gc_versions` runs every 100 cycles. It computes the minimum cycle across all heap and parked events, and discards versions older than that (keeping one version before the minimum as a read base).
+
+# Known Issues
+1. When using the `max-cycles` flag, since all loops in a proc run in the same OS thread, the fastest loop will cause the proc to terminate early
+      a. This issues also causes issues with benchmarking
